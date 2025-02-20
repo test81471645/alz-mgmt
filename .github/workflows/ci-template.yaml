@@ -1,0 +1,246 @@
+---
+name: Continuous Integration
+on:
+  workflow_call:
+
+jobs:
+  validate:
+    name: Validate Bicep
+    runs-on:
+      ubuntu-latest
+    environment: alz-mgmt-plan
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout Bicep Module
+        uses: actions/checkout@v4
+
+      - name: Install Bicep and Update Az Module
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-installer@main
+
+      - name: Check for Custom Modules
+        shell: pwsh
+        working-directory: config
+        run: |
+          if (Test-Path -Path ./custom-modules/*)
+          {
+            echo "CUSTOM_MODULES=true" >> $env:GITHUB_ENV
+            echo "Set CUSTOM_MODULES to true"
+          }
+          else
+          {
+            echo "Set CUSTOM_MODULES to false"
+          }
+
+      - name: Bicep Build & Lint All Custom Modules
+        shell: pwsh
+        if: ${{ env.CUSTOM_MODULES == 'true' }}
+        working-directory: config/custom-modules
+        run: |
+          $output = @()
+          Get-ChildItem -Recurse -Filter '*.bicep' | ForEach-Object {
+              Write-Information "==> Attempting Bicep Build For File: $_" -InformationAction Continue
+              $bicepOutput = bicep build $_.FullName 2>&1
+              if ($LastExitCode -ne 0)
+              {
+                foreach ($item in $bicepOutput) {
+                  $output += "$($item) `r`n"
+                }
+              }
+              else
+              {
+                echo "Bicep Build Successful for File: $_"
+              }
+          }
+          if ($output.length -gt 0) {
+            throw $output
+          }
+
+  whatif:
+    name: What If
+    runs-on:
+      ubuntu-latest
+    concurrency: mgmt-tfstate
+    environment: alz-mgmt-plan
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      PARAMETERS_FILE_NAME: parameters.json
+
+    steps:
+      - name: Checkout Bicep Module
+        uses: actions/checkout@v4
+
+      - name: Get Bicep Variables
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-variables@main
+        with:
+          parameters_file_name: ${{ env.PARAMETERS_FILE_NAME }}
+
+      - name: Get On Demand Folder infra-as-code
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-on-demand-folder@main
+        with:
+          repository: "https://github.com/Azure/ALZ-Bicep"
+          releaseArtifactName: "accelerator.zip"
+          releaseVersion: "${{ env.RELEASE_VERSION }}"
+          sourcePath: "infra-as-code"
+          targetPath: "infra-as-code"
+
+      - name: Install Bicep and Update Az Module
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-installer@main
+
+      - name: OIDC Login to Tenant
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
+      - name: First Deployment Check
+        id: firstDeploymentCheck
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-first-deployment-check@main
+        with:
+          managementGroupId: ${{ env.MANAGEMENT_GROUP_ID }}
+      - name: 'What If: Management Groups Deployment'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Management Groups Deployment'
+          templateFilePath: './infra-as-code/bicep/modules/managementGroups/managementGroupsScopeEscape.bicep'
+          templateParametersFilePath: './config/custom-parameters/managementGroups.parameters.all.json'
+          managementGroupId: '${{ env.ROOT_PARENT_MANAGEMENT_GROUP_ID }}'
+          subscriptionId: ''
+          resourceGroupName: ''
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'managementGroup'
+          firstRunWhatIf: 'true'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Logging and Sentinel Resource Group Deployment'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Logging and Sentinel Resource Group Deployment'
+          templateFilePath: './infra-as-code/bicep/modules/resourceGroup/resourceGroup.bicep'
+          templateParametersFilePath: './config/custom-parameters/resourceGroupLoggingAndSentinel.parameters.all.json'
+          managementGroupId: ''
+          subscriptionId: '${{ env.MANAGEMENT_SUBSCRIPTION_ID }}'
+          resourceGroupName: ''
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'subscription'
+          firstRunWhatIf: 'true'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Logging and Sentinel Deployment'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Logging and Sentinel Deployment'
+          templateFilePath: './infra-as-code/bicep/modules/logging/logging.bicep'
+          templateParametersFilePath: './config/custom-parameters/logging.parameters.all.json'
+          managementGroupId: ''
+          subscriptionId: '${{ env.MANAGEMENT_SUBSCRIPTION_ID }}'
+          resourceGroupName: '${{ env.LOGGING_RESOURCE_GROUP }}'
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'resourceGroup'
+          firstRunWhatIf: 'false'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Custom Policy Definitions Deployment'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Custom Policy Definitions Deployment'
+          templateFilePath: './infra-as-code/bicep/modules/policy/definitions/customPolicyDefinitions.bicep'
+          templateParametersFilePath: './config/custom-parameters/customPolicyDefinitions.parameters.all.json'
+          managementGroupId: '${{ env.MANAGEMENT_GROUP_ID }}'
+          subscriptionId: ''
+          resourceGroupName: ''
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'managementGroup'
+          firstRunWhatIf: 'false'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Custom Role Definitions Deployment'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Custom Role Definitions Deployment'
+          templateFilePath: './infra-as-code/bicep/modules/customRoleDefinitions/customRoleDefinitions.bicep'
+          templateParametersFilePath: './config/custom-parameters/customRoleDefinitions.parameters.all.json'
+          managementGroupId: '${{ env.MANAGEMENT_GROUP_ID }}'
+          subscriptionId: ''
+          resourceGroupName: ''
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'managementGroup'
+          firstRunWhatIf: 'false'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Custom Management Group Diagnostic Settings'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Custom Management Group Diagnostic Settings'
+          templateFilePath: './infra-as-code/bicep/orchestration/mgDiagSettingsAll/mgDiagSettingsAll.bicep'
+          templateParametersFilePath: './config/custom-parameters/mgDiagSettingsAll.parameters.all.json'
+          managementGroupId: '${{ env.MANAGEMENT_GROUP_ID }}'
+          subscriptionId: ''
+          resourceGroupName: ''
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'managementGroup'
+          firstRunWhatIf: 'false'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Built-in and Custom Policy Assignments Deployment'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Built-in and Custom Policy Assignments Deployment'
+          templateFilePath: './infra-as-code/bicep/modules/policy/assignments/alzDefaults/alzDefaultPolicyAssignments.bicep'
+          templateParametersFilePath: './config/custom-parameters/alzDefaultPolicyAssignments.parameters.all.json'
+          managementGroupId: '${{ env.MANAGEMENT_GROUP_ID }}'
+          subscriptionId: ''
+          resourceGroupName: ''
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'managementGroup'
+          firstRunWhatIf: 'false'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Deploy Subscription Placement'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Deploy Subscription Placement'
+          templateFilePath: './infra-as-code/bicep/orchestration/subPlacementAll/subPlacementAll.bicep'
+          templateParametersFilePath: './config/custom-parameters/subPlacementAll.parameters.all.json'
+          managementGroupId: '${{ env.MANAGEMENT_GROUP_ID }}'
+          subscriptionId: ''
+          resourceGroupName: ''
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'managementGroup'
+          firstRunWhatIf: 'false'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Connectivity Resource Group Deployment'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Connectivity Resource Group Deployment'
+          templateFilePath: './infra-as-code/bicep/modules/resourceGroup/resourceGroup.bicep'
+          templateParametersFilePath: './config/custom-parameters/resourceGroupConnectivity.parameters.all.json'
+          managementGroupId: ''
+          subscriptionId: '${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}'
+          resourceGroupName: ''
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'subscription'
+          firstRunWhatIf: 'true'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
+      - name: 'What If: Hub (Hub-and-Spoke) Deployment'
+        uses: test81471645/alz-mgmt-templates/.github/actions/bicep-deploy@main
+        with:
+          displayName: 'Hub (Hub-and-Spoke) Deployment'
+          templateFilePath: './infra-as-code/bicep/modules/hubNetworking/hubNetworking.bicep'
+          templateParametersFilePath: './config/custom-parameters/hubNetworking.parameters.all.json'
+          managementGroupId: ''
+          subscriptionId: '${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}'
+          resourceGroupName: '${{ env.CONNECTIVITY_RESOURCE_GROUP }}'
+          location: '${{ env.LOCATION }}'
+          deploymentType: 'resourceGroup'
+          firstRunWhatIf: 'false'
+          firstDeployment: '${{ env.firstDeployment }}'
+          whatIfEnabled: 'true'
